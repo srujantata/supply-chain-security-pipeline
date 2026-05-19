@@ -1,91 +1,171 @@
 # Supply Chain Security Pipeline
 
-[![GitHub Actions](https://github.com/yourusername/supply-chain-security-pipeline/workflows/Main%20Pipeline/badge.svg)](https://github.com/yourusername/supply-chain-security-pipeline/actions)
-[![CodeQL](https://github.com/yourusername/supply-chain-security-pipeline/security/code-scanning/overview)](https://github.com/yourusername/supply-chain-security-pipeline/security/code-scanning)
+[![CI](https://github.com/srujantata/supply-chain-security-pipeline/actions/workflows/pipeline.yml/badge.svg)](https://github.com/srujantata/supply-chain-security-pipeline/actions)
+[![SLSA Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
 
-This repository demonstrates a comprehensive software supply chain security pipeline using Syft, Grype, Cosign/Sigstore, and SLSA Level 3 provenance. The pipeline enforces security gates on every pull request to ensure that only secure code is merged into the main branch.
+End-to-end software supply chain security enforced on every pull request:
+**SBOM generation → vulnerability gating → keyless image signing → SLSA L3 provenance.**
+Nothing ships unless every gate passes.
 
-## Architecture Diagram
+---
 
-+-------------------+
-| GitHub Pull Request|
-+---------^---------+
-          |
-          v
-+---------+---------+
-| Syft: SBOM Generation (CycloneDX + SPDX) |
-+---------^---------+
-          |
-          v
-+---------+---------+
-| Grype: Vulnerability Scanning (severity gates) |
-+---------^---------+
-          |
-          v
-+---------+---------+
-| Cosign/Sigstore: Keyless Image Signing with OIDC |
-+---------^---------+
-          |
-          v
-+---------+---------+
-| SLSA Level 3 Provenance via slsa-github-generator |
-+---------^---------+
-          |
-          v
-+-------------------+
-| GitHub Actions Pipeline |
-+-------------------+
+## How It Works
 
-## Full Pipeline Explanation
+```
+PR opened
+    │
+    ▼
+Syft  ──── generates SBOM (CycloneDX + SPDX)
+    │
+    ▼
+Grype ──── scans SBOM for CVEs
+    │       CRITICAL found? ──► PR blocked ✗
+    │       Clean? ──► continue ✓
+    ▼
+Docker build + push to GHCR
+    │
+    ▼
+Cosign ─── keyless signing via GitHub OIDC
+    │       (no long-lived keys needed)
+    ▼
+slsa-github-generator ── attaches SLSA L3 provenance
+    │
+    ▼
+PR mergeable ✓
+```
 
-1. **GitHub Pull Request**: A developer submits a pull request to the main branch.
-2. **Syft: SBOM Generation (CycloneDX + SPDX)**: Syft generates Software Bill of Materials (SBOMs) in both CycloneDX and SPDX formats for the code changes in the PR.
-3. **Grype: Vulnerability Scanning (severity gates)**: Grype scans the images built from the code changes for known vulnerabilities. The pipeline fails if any critical vulnerabilities are detected.
-4. **Cosign/Sigstore: Keyless Image Signing with OIDC**: Cosign signs the images using keyless signing with OIDC, ensuring that only authorized users can push signed images to the repository.
-5. **SLSA Level 3 Provenance via slsa-github-generator**: SLSA Level 3 provenance is generated for the build process, providing a tamper-proof record of how the image was built.
-6. **GitHub Actions Pipeline**: The pipeline enforces all security gates on every PR. If any gate fails, the PR cannot be merged.
+---
 
-## Example Grype Output Showing Blocked CVEs
+## Tools & What They Do
 
-+-------------------+-------------------+
-| Vulnerability ID  | Severity          |
-+-------------------+-------------------+
-| CVE-2021-43798     | CRITICAL          |
-| CVE-2021-45046     | HIGH              |
-+-------------------+-------------------+
+| Tool | Role | Output |
+|------|------|--------|
+| [Syft](https://github.com/anchore/syft) | SBOM generation | `sbom.cyclonedx.json`, `sbom.spdx.json` |
+| [Grype](https://github.com/anchore/grype) | Vulnerability scanning against SBOM | Fails CI on CRITICAL/HIGH |
+| [Cosign](https://github.com/sigstore/cosign) | Keyless image signing via Sigstore | Signature attached to image digest |
+| [slsa-github-generator](https://github.com/slsa-framework/slsa-github-generator) | SLSA Level 3 provenance | `.intoto.jsonl` attestation |
 
-The pipeline will block the PR if any critical vulnerabilities are detected.
+---
 
-## How to Verify a Signed Image
+## Pipeline Walkthrough
 
-To verify a signed image, you can use Cosign:
+### Step 1 — SBOM Generation (Syft)
 
-cosign verify --key cosign.pub <image-url>
+Syft scans the container image and outputs a complete bill of materials listing every package,
+library, and their exact versions. Two formats are generated: CycloneDX (machine-readable,
+used by Grype) and SPDX (compliance-friendly for auditors).
 
-This command will check that the image is signed by a trusted key and has not been tampered with.
+```yaml
+# .github/workflows/pipeline.yml (excerpt)
+- name: Generate SBOM
+  uses: anchore/sbom-action@v0
+  with:
+    image: ghcr.io/srujantata/my-app:${{ github.sha }}
+    format: cyclonedx-json
+    output-file: sbom.cyclonedx.json
+```
 
-## SBOM Example Snippet
+### Step 2 — Vulnerability Scanning (Grype)
 
-Here's an example snippet from a generated SBOM in CycloneDX format:
+Grype scans the SBOM and blocks the pipeline if any CRITICAL severity CVEs are found.
+HIGH severities generate a warning. The threshold is configurable via `.grype.yaml`.
 
+Example blocked output:
+```
+NAME              INSTALLED   FIXED-IN    TYPE    VULNERABILITY   SEVERITY
+libssl1.1         1.1.1f-1    1.1.1n-1    deb     CVE-2022-0778   CRITICAL
+curl              7.68.0-1    7.74.0-1    deb     CVE-2021-22945  HIGH
+
+2 vulnerabilities found
+1 CRITICAL — pipeline blocked
+```
+
+### Step 3 — Keyless Image Signing (Cosign)
+
+Images are signed using Cosign's keyless flow: the GitHub Actions OIDC token proves the
+workflow's identity to Sigstore's Fulcio CA, which issues a short-lived certificate.
+No long-lived signing keys are stored anywhere.
+
+```bash
+# Sign (in CI — no key needed)
+cosign sign --yes ghcr.io/srujantata/my-app@${DIGEST}
+
+# Verify (anywhere)
+cosign verify \
+  --certificate-identity-regexp="https://github.com/srujantata/supply-chain-security-pipeline" \
+  --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+  ghcr.io/srujantata/my-app:latest
+```
+
+### Step 4 — SLSA Level 3 Provenance
+
+The `slsa-github-generator` workflow runs in an isolated, ephemeral environment and generates
+a cryptographically-signed attestation describing exactly how the image was built:
+which commit, which workflow, which runner, and which inputs.
+
+```bash
+# Verify provenance
+slsa-verifier verify-image ghcr.io/srujantata/my-app:latest \
+  --source-uri github.com/srujantata/supply-chain-security-pipeline \
+  --source-branch main
+```
+
+---
+
+## SBOM Example (CycloneDX snippet)
+
+```json
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.4",
   "version": 1,
+  "metadata": {
+    "component": {
+      "name": "my-app",
+      "version": "1.0.0",
+      "type": "container"
+    }
+  },
   "components": [
     {
-      "name": "example-library",
-      "version": "1.0.0",
-      "type": "library"
+      "name": "openssl",
+      "version": "1.1.1n-0+deb11u4",
+      "type": "library",
+      "purl": "pkg:deb/debian/openssl@1.1.1n-0+deb11u4"
     }
   ]
 }
+```
+
+---
+
+## Grype Severity Gate (`.grype.yaml`)
+
+```yaml
+fail-on-severity: critical
+ignore:
+  # Accepted risk — no fix available, tracked in issue #42
+  - vulnerability: CVE-2023-44487
+    reason: "HTTP/2 rapid reset — mitigated at LB layer"
+```
+
+---
+
+## Why This Matters
+
+| Threat | Mitigation |
+|--------|-----------|
+| Dependency with known CVE ships to prod | Grype blocks PR at severity threshold |
+| Tampered image pushed between build and deploy | Cosign signature + digest pinning |
+| Can't prove how image was built | SLSA L3 provenance attestation |
+| No inventory of what's in the image | SBOM stored as release artifact |
+
+---
 
 ## Skills Demonstrated
 
-- Software supply chain security
-- Syft for SBOM generation
-- Grype for vulnerability scanning
-- Cosign/Sigstore for keyless image signing
-- SLSA Level 3 provenance
-- GitHub Actions pipeline automation
+- Software supply chain security (SLSA framework)
+- SBOM generation in CycloneDX and SPDX formats
+- Vulnerability scanning with severity-gated CI
+- Keyless container image signing with Sigstore/Cosign
+- GitHub Actions OIDC integration for zero-secret CI
