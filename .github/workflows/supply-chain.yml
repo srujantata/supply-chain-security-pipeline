@@ -1,0 +1,99 @@
+name: Supply Chain Security
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+jobs:
+  build-and-secure:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub (if needed)
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login --username ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Build Docker image
+        id: build-image
+        run: |
+          docker build . -t ${{ github.repository }}:${{ github.sha }}
+          echo "::set-output name=image::${{ github.repository }}:${{ github.sha }}"
+
+      - name: Generate SBOM with Syft
+        run: syft packages docker:$IMAGE -o cyclonedx-json > sbom.json
+
+      - name: Scan SBOM with Grype
+        run: grype sbom:sbom.json --fail-on critical
+        env:
+          GRYPE_INSECURE: true
+
+      - name: Sign image with Cosign keyless (OIDC)
+        run: cosign sign --yes $IMAGE
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+
+      - name: Generate SLSA provenance using slsa-github-generator
+        id: generate-provenance
+        uses: slsa-framework/slsa-github-generator@v0.2.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          cosign_public_key: ${{ secrets.COSIGN_PUBLIC_KEY }}
+
+      - name: Upload SBOM as workflow artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom.json
+          path: sbom.json
+
+      - name: Post SBOM summary as PR comment
+        id: post-comment
+        uses: actions/github-script@v5
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const core = require('@actions/core');
+            const github = require('@actions/github');
+
+            async function run() {
+              try {
+                const context = github.context;
+                const octokit = github.getOctokit(core.getInput('github-token'));
+
+                const sbomContent = await fs.promises.readFile('sbom.json', 'utf8');
+                const sbomSummary = JSON.parse(sbomContent);
+
+                const comment = `
+                  ### SBOM Summary
+
+                  - **Total Packages**: ${sbomSummary.components.length}
+                  - **Critical CVEs**: ${sbomSummary.vulnerabilities.filter(vuln => vuln.severity === 'CRITICAL').length}
+                  - **High CVEs**: ${sbomSummary.vulnerabilities.filter(vuln => vuln.severity === 'HIGH').length}
+                  - **Medium CVEs**: ${sbomSummary.vulnerabilities.filter(vuln => vuln.severity === 'MEDIUM').length}
+                `;
+
+                await octokit.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: comment
+                });
+              } catch (error) {
+                core.setFailed(error.message);
+              }
+            }
+
+            run();
